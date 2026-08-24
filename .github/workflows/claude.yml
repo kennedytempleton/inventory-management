@@ -49,4 +49,6 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Authenticates against the Claude Pro/Max subscription rather than a
+          # pay-as-you-go Console API key, so runs do not bill separately.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
