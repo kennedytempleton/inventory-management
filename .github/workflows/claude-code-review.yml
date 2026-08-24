@@ -1,0 +1,61 @@
+name: Claude Code Review
+
+# Deliberately uses `pull_request`, not `pull_request_target`.
+#
+# On a public repository, `pull_request` runs a fork's PR with a read-only token
+# and NO access to repository secrets, so a malicious PR cannot reach
+# ANTHROPIC_API_KEY. `pull_request_target` would run the base repo's workflow with
+# secrets exposed against untrusted head code, which is the standard way these
+# integrations get their keys stolen. The tradeoff is that reviews only run on
+# PRs raised from branches in this repository, which is what we want here.
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Automated PR review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+          # Posts a checklist comment and ticks items off as the review proceeds.
+          track_progress: true
+
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. This is a Vue 3 + FastAPI inventory
+            management app; see CLAUDE.md for conventions that apply.
+
+            Focus on:
+
+            1. **Correctness** - logic errors, unhandled edge cases, incorrect
+               error handling.
+            2. **Security** - input validation, injection risks, anything that
+               could leak data through the public API.
+            3. **Performance** - unnecessary re-renders, N+1 style data access,
+               work done per-keystroke that should be debounced.
+            4. **Testing** - whether new behaviour is covered by tests in
+               tests/backend, and whether the tests assert the right invariant
+               rather than pinning current output.
+            5. **Conventions** - non-obvious logic must carry a comment
+               explaining the *why*, per CLAUDE.md.
+
+            Use inline comments for specific issues and a top-level comment for
+            general observations. Be concise; skip praise unless it is load-bearing.
+
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
