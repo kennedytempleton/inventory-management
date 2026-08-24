@@ -51,4 +51,7 @@ jobs:
         with:
           # Authenticates against the Claude Pro/Max subscription rather than a
           # pay-as-you-go Console API key, so runs do not bill separately.
+          # Both are declared so either credential works. The action ignores an
+          # empty one, so whichever secret is actually set wins.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
