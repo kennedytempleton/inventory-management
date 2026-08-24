@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
-from pydantic import BaseModel
+from datetime import datetime, timedelta
+from pydantic import BaseModel, Field
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -120,6 +121,162 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+# Restocking
+#
+# These are separate from the PurchaseOrder models above, which are shaped around a
+# single backlog item (one supplier, one quantity). A restock order is multi-line —
+# it is the whole basket a budget was spent on — so it needs its own models.
+class RestockCandidate(BaseModel):
+    sku: str
+    name: str
+    category: str
+    warehouse: str
+    quantity_on_hand: int
+    reorder_point: int
+    unit_cost: float
+    current_demand: int
+    forecasted_demand: int
+    trend: str
+    growth_pct: float
+    shortfall_units: int
+    growth_score: float
+    shortfall_score: float
+    urgency_score: float
+    recommended_quantity: int
+    line_cost: float
+
+class RestockOrderLine(BaseModel):
+    """What the client sends per line. Name and cost are re-derived server-side from
+    inventory so a tampered or stale client can't dictate what an order is worth."""
+    sku: str
+    quantity: int = Field(gt=0)
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    customer: str
+    items: List[dict]
+    status: str
+    warehouse: str
+    category: str
+    order_date: str
+    expected_delivery: str
+    lead_time_days: int
+    total_value: float
+    budget: Optional[float] = None
+
+class CreateRestockOrderRequest(BaseModel):
+    lines: List[RestockOrderLine] = Field(min_length=1)
+    budget: Optional[float] = None
+
+# Submitted restock orders live in process only, matching how the rest of this demo
+# handles data — nothing is written back to disk, so a server restart clears them.
+# Deliberately kept out of `orders`: that list feeds revenue KPIs, quarterly reports
+# and monthly trends, and internally-raised restock orders are cost, not revenue.
+submitted_restock_orders: List[dict] = []
+
+# Scoring weights, out of 100. Shortfall outweighs growth because being below the
+# reorder point is a present stockout, while forecast growth is only a projection —
+# at comparable magnitudes the already-short item should always rank higher.
+SHORTFALL_WEIGHT = 60
+GROWTH_WEIGHT = 40
+
+# Growth saturation point: +30% forecast demand earns full growth points. Past that,
+# growth stops differentiating — a 200% spike is a data-quality question, not an
+# order six times more urgent.
+GROWTH_SATURATION = 0.30
+
+# Suppliers here quote per-pack, so recommended quantities round up to a pack of ten.
+RESTOCK_PACK_SIZE = 10
+
+# Supplier lead time by category, in days. Sourced from the spread already present in
+# orders.json, where expected_delivery - order_date ranges 7-14 days; heavier
+# electromechanical parts sit at the slow end of that range.
+LEAD_TIME_DAYS_BY_CATEGORY = {
+    "Actuators": 14,
+    "Power Supplies": 12,
+    "Controllers": 10,
+    "Sensors": 9,
+    "Circuit Boards": 7,
+}
+DEFAULT_LEAD_TIME_DAYS = 10
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+def build_restock_candidates(items: list) -> list:
+    """Join inventory to demand forecasts and score each item's restock urgency."""
+    forecasts_by_sku = {f["item_sku"]: f for f in demand_forecasts}
+    candidates = []
+
+    for item in items:
+        forecast = forecasts_by_sku.get(item["sku"])
+        if not forecast:
+            continue
+
+        current = forecast["current_demand"]
+        forecasted = forecast["forecasted_demand"]
+        reorder_point = item["reorder_point"]
+        on_hand = item["quantity_on_hand"]
+
+        growth_pct = (forecasted - current) / current if current > 0 else 0.0
+        shortfall_units = max(0, reorder_point - on_hand)
+        shortfall_pct = shortfall_units / reorder_point if reorder_point > 0 else 0.0
+
+        # Both terms clamp at zero so an overstocked item contributes no negative
+        # shortfall and a shrinking item no negative growth. An item with falling
+        # demand can still be recommended purely on shortfall, which is intended.
+        growth_score = GROWTH_WEIGHT * _clamp(growth_pct / GROWTH_SATURATION)
+        shortfall_score = SHORTFALL_WEIGHT * _clamp(shortfall_pct)
+
+        # Buy enough to absorb the forecast increase and climb back above the
+        # reorder point, then round up to a whole pack.
+        raw_quantity = max(0, forecasted - current) + shortfall_units
+        recommended_quantity = -(-raw_quantity // RESTOCK_PACK_SIZE) * RESTOCK_PACK_SIZE
+
+        # Nothing to buy: already above the reorder point with flat or falling demand.
+        if recommended_quantity == 0:
+            continue
+
+        candidates.append({
+            "sku": item["sku"],
+            "name": item["name"],
+            "category": item["category"],
+            "warehouse": item["warehouse"],
+            "quantity_on_hand": on_hand,
+            "reorder_point": reorder_point,
+            "unit_cost": item["unit_cost"],
+            "current_demand": current,
+            "forecasted_demand": forecasted,
+            "trend": forecast["trend"],
+            "growth_pct": round(growth_pct * 100, 1),
+            "shortfall_units": shortfall_units,
+            "growth_score": round(growth_score, 1),
+            "shortfall_score": round(shortfall_score, 1),
+            "urgency_score": round(growth_score + shortfall_score, 1),
+            "recommended_quantity": recommended_quantity,
+            "line_cost": round(recommended_quantity * item["unit_cost"], 2),
+        })
+
+    # Ties break on cheaper-first so the client's greedy budget fill packs more lines
+    # in at equal urgency.
+    candidates.sort(key=lambda c: (-c["urgency_score"], c["line_cost"]))
+    return candidates
+
+def _next_restock_order_number() -> str:
+    """Restock orders use their own RST- sequence so they are distinguishable at a
+    glance from the ORD- customer orders they sit alongside in the Orders view."""
+    return f"RST-2025-{len(submitted_restock_orders) + 1:04d}"
+
+def _lead_time_for_categories(categories: set) -> int:
+    """An order ships complete, so its lead time is that of its slowest line."""
+    if not categories:
+        return DEFAULT_LEAD_TIME_DAYS
+    return max(
+        LEAD_TIME_DAYS_BY_CATEGORY.get(category, DEFAULT_LEAD_TIME_DAYS)
+        for category in categories
+    )
+
 # API endpoints
 @app.get("/")
 def root():
@@ -178,6 +335,85 @@ def get_backlog():
         item_dict["has_purchase_order"] = has_po
         result.append(item_dict)
     return result
+
+@app.get("/api/restock-candidates", response_model=List[RestockCandidate])
+def get_restock_candidates(
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None
+):
+    """Get restock recommendations ranked by urgency, with optional filtering.
+
+    Ranking lives here rather than in the browser so the POST below can re-derive
+    costs from the same code path, and so it is covered by tests — there is no
+    frontend test framework in this project. The client applies the budget on top.
+    """
+    filtered_inventory = apply_filters(inventory_items, warehouse, category)
+    return build_restock_candidates(filtered_inventory)
+
+@app.post("/api/restock-orders", response_model=RestockOrder, status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Submit a restock order. Stored in memory only; resets on server restart."""
+    inventory_by_sku = {item["sku"]: item for item in inventory_items}
+
+    items = []
+    warehouses = set()
+    categories = set()
+    total_value = 0.0
+
+    for line in request.lines:
+        item = inventory_by_sku.get(line.sku)
+        if not item:
+            raise HTTPException(status_code=404, detail=f"Inventory item {line.sku} not found")
+
+        line_total = line.quantity * item["unit_cost"]
+        total_value += line_total
+        warehouses.add(item["warehouse"])
+        categories.add(item["category"])
+
+        # Same item shape as orders.json so the Orders view renders these with the
+        # markup it already has.
+        items.append({
+            "sku": item["sku"],
+            "name": item["name"],
+            "quantity": line.quantity,
+            "unit_price": item["unit_cost"],
+        })
+
+    lead_time_days = _lead_time_for_categories(categories)
+    order_date = datetime.now()
+    expected_delivery = order_date + timedelta(days=lead_time_days)
+
+    order = {
+        "id": f"restock-{len(submitted_restock_orders) + 1}",
+        "order_number": _next_restock_order_number(),
+        # A restock order's counterparty is the factory itself, so there is no real
+        # customer. A literal keeps the Order-compatible shape without weakening
+        # validation on the 250 seeded customer orders.
+        "customer": "Internal Restock",
+        "items": items,
+        "status": "Processing",
+        # These mirror the Order fields so the record survives apply_filters().
+        "warehouse": warehouses.pop() if len(warehouses) == 1 else "Multiple",
+        "category": categories.pop() if len(categories) == 1 else "Multiple",
+        "order_date": order_date.isoformat(timespec="seconds"),
+        "expected_delivery": expected_delivery.isoformat(timespec="seconds"),
+        "lead_time_days": lead_time_days,
+        "total_value": round(total_value, 2),
+        "budget": request.budget,
+    }
+
+    submitted_restock_orders.append(order)
+    return order
+
+@app.get("/api/restock-orders", response_model=List[RestockOrder])
+def get_restock_orders(
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None,
+    status: Optional[str] = None
+):
+    """List submitted restock orders, newest first."""
+    filtered = apply_filters(submitted_restock_orders, warehouse, category, status)
+    return list(reversed(filtered))
 
 @app.get("/api/dashboard/summary")
 def get_dashboard_summary(

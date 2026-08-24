@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 server_path = Path(__file__).parent.parent.parent / "server"
 sys.path.insert(0, str(server_path))
 
-from main import app
+from main import app, submitted_restock_orders
 
 
 @pytest.fixture
@@ -19,6 +19,19 @@ def client():
     """Create a test client for the FastAPI application."""
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture(autouse=True)
+def reset_restock_orders():
+    """Clear submitted restock orders between tests.
+
+    The store is a module-level list that persists for the life of the process, so
+    without this a POST in one test leaks into the next one's counts and order
+    numbers, making results depend on test execution order.
+    """
+    submitted_restock_orders.clear()
+    yield
+    submitted_restock_orders.clear()
 
 
 @pytest.fixture

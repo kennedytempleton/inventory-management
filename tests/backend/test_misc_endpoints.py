@@ -65,23 +65,41 @@ class TestDemandEndpoints:
                 assert percent_change < 2.0, \
                     f"Item {item['item_name']} has {percent_change:.2f}% change, expected < 2%"
 
-    def test_demand_forecast_has_new_items(self, client):
-        """Test that new demand forecast items exist."""
-        response = client.get("/api/demand")
-        data = response.json()
+    def test_every_forecast_sku_exists_in_inventory(self, client):
+        """Test that every forecast SKU joins to a real inventory item.
 
-        # Check for the new items we added
-        skus = [item["item_sku"] for item in data]
+        This replaces an older test that asserted the presence of SNR-420 and
+        CTL-330. Those SKUs were part of a legacy catalog that no longer exists in
+        inventory.json, so the old test was pinning a broken join in place: only 1
+        of the 9 forecasts could be matched to an item, which left any feature
+        needing both demand and cost data with almost no rows to work with.
+        """
+        forecasts = client.get("/api/demand").json()
+        inventory_skus = {item["sku"] for item in client.get("/api/inventory").json()}
 
-        # Should have Temperature Sensor Module and Logic Controller Board
-        assert "SNR-420" in skus, "Missing Temperature Sensor Module"
-        assert "CTL-330" in skus, "Missing Logic Controller Board"
+        orphans = [f["item_sku"] for f in forecasts if f["item_sku"] not in inventory_skus]
+        assert not orphans, f"Forecast SKUs missing from inventory: {', '.join(orphans)}"
 
-        # Verify they are marked as stable
-        for item in data:
-            if item["item_sku"] in ["SNR-420", "CTL-330"]:
-                assert item["trend"].lower() == "stable", \
-                    f"New item {item['item_name']} should have stable trend"
+    def test_forecast_names_match_inventory_names(self, client):
+        """Test that forecast item names agree with their inventory records.
+
+        The Japanese locale translates product names by exact string lookup, so a
+        forecast name that drifts from its inventory name silently falls back to
+        English on the Demand and Restocking tabs.
+        """
+        forecasts = client.get("/api/demand").json()
+        inventory_names = {item["sku"]: item["name"] for item in client.get("/api/inventory").json()}
+
+        for forecast in forecasts:
+            expected = inventory_names.get(forecast["item_sku"])
+            assert forecast["item_name"] == expected, \
+                f"{forecast['item_sku']}: forecast name '{forecast['item_name']}' != inventory name '{expected}'"
+
+    def test_demand_forecast_covers_all_trends(self, client):
+        """Test that the forecast set spans every trend, so trend-driven UI has data."""
+        trends = {item["trend"].lower() for item in client.get("/api/demand").json()}
+        assert {"increasing", "stable", "decreasing"} <= trends, \
+            f"Expected all three trends to be represented, found {trends}"
 
 
 class TestBacklogEndpoints:
